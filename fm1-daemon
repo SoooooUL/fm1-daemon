@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+# fm1-daemon —— 极简版 org.freedesktop.FileManager1 守护进程
+#
+# 作用：
+#   1) 常驻并抢占 D-Bus 名 org.freedesktop.FileManager1。
+#      这个名是"谁先占谁说话"，只要它被占着，nautilus 就抢不走，
+#      所有应用(Firefox/WeChat/等)的"打开所在文件夹"都会落到这里。
+#   2) 收到 ShowItems/ShowFolders/ShowItemProperties 时，调用你在配置里
+#      指定的文件管理器(默认 thunar)。
+#
+# 为什么不用 thunar 自己常驻：
+#   thunar 是 GTK3，不热重载主题；常驻的话换壁纸后颜色不会变。
+#   本守护进程只是一段无界面的核心逻辑，跟主题无关；thunar 按需启动，
+#   每次都是新进程 → 颜色永远是最新的。
+#
+# 配置：~/.config/fm1-daemon/command（一行一个参数），默认：
+#   /usr/bin/thunar
+#   --window
+#
+# 需要：python-dbus、python-gobject（Arch: python-dbus python-gobject）
+
+import os
+import sys
+from subprocess import Popen, DEVNULL
+from urllib.parse import unquote
+
+import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+BUS_NAME = "org.freedesktop.FileManager1"
+OBJ_PATH = "/org/freedesktop/FileManager1"
+CONFIG_FILE = os.path.expanduser("~/.config/fm1-daemon/command")
+DEFAULT_COMMAND = ["/usr/bin/thunar", "--window"]
+
+mainloop = None
+# 记录启动过的文件管理器进程；定期回收，避免它们退出后变成僵尸
+_procs = []
+
+
+def log(msg):
+    print(f"fm1-daemon: {msg}", file=sys.stderr, flush=True)
+
+
+def reap():
+    _procs[:] = [p for p in _procs if p.poll() is None]
+    return True
+
+
+def load_command():
+    """读取配置文件；一行一个参数。忽略空行和 # 注释。"""
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            parts = [ln.strip() for ln in f
+                     if ln.strip() and not ln.lstrip().startswith("#")]
+        if parts:
+            return parts
+    except OSError:
+        pass
+    return list(DEFAULT_COMMAND)
+
+
+class FileManager1(dbus.service.Object):
+    def __init__(self, command, bus, path):
+        self.command = command
+        super().__init__(bus, path)
+
+    def _open(self, uris):
+        reap()                               # 先回收上一批已结束的子进程
+        args = list(self.command)
+        for uri in uris:
+            path = str(uri)
+            if path.startswith("file://"):   # 去前缀 + URL 解码，得到本机路径
+                path = unquote(path[len("file://"):])
+            args.append(path)
+        try:
+            # 不等待、脱离会话启动，避免拖住 dbus 调用方
+            _procs.append(Popen(args, stdin=DEVNULL, stdout=DEVNULL,
+                                stderr=DEVNULL, start_new_session=True))
+            log("opened: " + " ".join(args))
+        except OSError as e:
+            log(f"failed to run {args}: {e}")
+
+    @dbus.service.method(BUS_NAME, in_signature="ass", out_signature="")
+    def ShowItems(self, uris, startup_id):
+        self._open(uris)
+
+    @dbus.service.method(BUS_NAME, in_signature="ass", out_signature="")
+    def ShowFolders(self, uris, startup_id):
+        self._open(uris)
+
+    @dbus.service.method(BUS_NAME, in_signature="ass", out_signature="")
+    def ShowItemProperties(self, uris, startup_id):
+        self._open(uris)
+
+    @dbus.service.method(BUS_NAME, in_signature="", out_signature="")
+    def Exit(self):
+        log("Exit requested")
+        if mainloop is not None:
+            mainloop.quit()
+
+
+def main():
+    global mainloop
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    session_bus = dbus.SessionBus()
+
+    command = load_command()
+    log("command = " + " ".join(command))
+
+    # 注意：这两个对象必须一直持有引用，否则被 GC 回收时名字/对象路径会失效
+    try:
+        bus_name = dbus.service.BusName(BUS_NAME, session_bus,
+                                        allow_replacement=False,
+                                        replace_existing=False,
+                                        do_not_queue=True)
+    except dbus.exceptions.NameExistsException:
+        log(f"{BUS_NAME} is already owned by someone else; exiting")
+        return 1
+
+    fm_object = FileManager1(command, session_bus, OBJ_PATH)
+    GLib.timeout_add(500, reap)   # 每 0.5 秒回收一次，僵尸不会积压
+    log("listening for method calls")
+
+    mainloop = GLib.MainLoop()
+    mainloop.run()
+    log("exited")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

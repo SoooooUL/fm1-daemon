@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=@HOME@/.local/bin/fm1-daemon

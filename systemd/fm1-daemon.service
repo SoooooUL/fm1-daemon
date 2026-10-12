@@ -1,0 +1,15 @@
+[Unit]
+Description=FileManager1 D-Bus daemon (owns org.freedesktop.FileManager1)
+Documentation=https://github.com/SoooooUL/fm1-daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@HOME@/.local/bin/fm1-daemon
+# 若因名字被别人(例如 Nautilus)抢先占用而退出，稍后自动重试接管
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

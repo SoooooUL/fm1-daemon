@@ -1,0 +1,17 @@
+# fm1-daemon 调用的文件管理器命令：一行一个参数（空行与 # 注释会被忽略）。
+# 收到"打开所在文件夹"时，会执行：<以下参数> <文件路径...>
+#
+# 默认：Thunar
+/usr/bin/thunar
+--window
+
+# 换成 Nemo：
+# /usr/bin/nemo
+#
+# 换成 Deepin File Manager：
+# /usr/bin/dde-file-manager
+#
+# 换成终端文件管理器（例：kitty + yazi）：
+# /usr/bin/kitty
+# -e
+# yazi
