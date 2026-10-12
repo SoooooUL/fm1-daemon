@@ -7,6 +7,51 @@
 
 ---
 
+## 背景：我遇到的问题
+
+> 下面是我（项目发起人）当时遇到的实际情况，也是这个项目存在的原因。
+
+**环境**
+
+- 发行版：Arch Linux
+- 窗口管理器：niri
+- 文件管理器：Thunar 4.20（已用 `xdg-mime default thunar.desktop inode/directory` 设为默认）
+- 系统里同时还装着 Nautilus 51（GNOME Files）—— 它是 `xdg-desktop-portal-gnome` 的依赖（录屏要用），**不能卸载**
+- 桌面壳：Noctalia，会随壁纸重新生成 GTK 主题（`~/.config/gtk-*/gtk.css`），所以 Thunar 的颜色要能跟着壁纸变
+
+**现象**
+
+1. 在 Firefox、微信（WeChat）等应用里点"打开所在文件夹 / 在文件夹中显示"，弹出来的却是 **GNOME 的 Nautilus**，不是我设的 Thunar。
+2. 可是 `xdg-mime query default inode/directory` 和 `gio mime inode/directory` 都显示默认应用是 Thunar；`xdg-open .` 也确实打开 Thunar。
+3. 最迷惑的是它**时好时坏**：有时正常打开 Thunar，过一会儿（或做过某些操作后）又变回 Nautilus。
+
+**排查后的结论**
+
+- 这类"打开所在文件夹"在 Firefox / Chromium 系 / WeChat 里走的是 **D-Bus `org.freedesktop.FileManager1.ShowItems`**，和 `xdg-open` / GIO 默认应用是**两条完全不同的路径**，所以改 `mimeapps.list` 对它没有用。
+- 这个 D-Bus 名字是**"先占先得"**：只要系统里有一个 Nautilus 实例在运行，它就会长期霸占这个名字，之后所有应用的请求都归它——直到它退出为止。
+- 而 Nautilus 会被这些地方拉起来：
+  - WeChat 的兜底逻辑：直接执行 `nautilus --select <文件>`
+  - 我自己设的一个"打开 Nautilus"的快捷键
+  - 任何一次手动打开 Nautilus
+
+**试过、但都不够好的办法**
+
+| 办法 | 为什么不够用 |
+|---|---|
+| 把 `~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service` 指向 Thunar | 只在"名字没人占"时决定激活谁；Nautilus 一旦已在跑就完全无效 |
+| 让 `thunar --daemon` 常驻抢占名字 | 能占住名字，但 Thunar 是 GTK3、**不热重载主题**，换壁纸后 Thunar 的颜色不会跟着变 |
+| 在 PATH 里放一个 `nautilus` 包装脚本（转发给 Thunar） | 只能挡住"命令行启动 nautilus"，挡不住已经跑起来的实例，也不是根本解法 |
+
+**最终解决**
+
+让一个**无界面的常驻守护进程**（就是本项目）占住 `org.freedesktop.FileManager1`，收到请求后按配置去调用 Thunar：
+
+- 守护进程跟 GTK / 主题无关，常驻也不会造成"颜色不更新"；
+- Thunar 变成按需启动，每次都是新进程 → 颜色永远跟当前主题一致；
+- 名字一直被占着 → Nautilus 再也抢不走。
+
+---
+
 ## 它解决什么问题
 
 在 GNOME 之外的桌面环境（niri / Hyprland / i3 / Sway …）上，"打开所在文件夹""在文件夹中显示"这类操作通常有两条路径：
