@@ -22,19 +22,27 @@
 import os
 import sys
 from subprocess import Popen, DEVNULL
-from urllib.parse import unquote
+from urllib.parse import urlparse, unquote
 
 import dbus
 import dbus.service
 import dbus.mainloop.glib
-from gi.repository import GLib
+from gi.repository import GLib, Gio
 
 BUS_NAME = "org.freedesktop.FileManager1"
 OBJ_PATH = "/org/freedesktop/FileManager1"
-CONFIG_FILE = os.path.expanduser("~/.config/fm1-daemon/command")
+# 配置路径：默认 ~/.config/fm1-daemon/command，可用 FM1_DAEMON_CONFIG 覆盖
+# （主要用于测试：在隔离总线里验证时指向临时配置）
+CONFIG_FILE = os.environ.get("FM1_DAEMON_CONFIG") or os.path.expanduser(
+    "~/.config/fm1-daemon/command")
 DEFAULT_COMMAND = ["/usr/bin/thunar", "--window"]
 
+# 当前生效的命令行参数。用列表原地更新（CONFIG[:] = ...），
+# 这样所有引用方不需要重新拿引用就能看到最新配置
+CONFIG = list(DEFAULT_COMMAND)
+
 mainloop = None
+_reload_timer = None
 # 记录启动过的文件管理器进程；定期回收，避免它们退出后变成僵尸
 _procs = []
 
@@ -49,7 +57,9 @@ def reap():
 
 
 def load_command():
-    """读取配置文件；一行一个参数。忽略空行和 # 注释。"""
+    """读取配置文件；一行一个参数，忽略空行和 # 注释。
+    读不到或内容为空时返回 None，回退策略由调用方决定
+    （启动时回退默认值；运行中热重载时保留旧值）。"""
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             parts = [ln.strip() for ln in f
@@ -58,22 +68,56 @@ def load_command():
             return parts
     except OSError:
         pass
-    return list(DEFAULT_COMMAND)
+    return None
+
+
+def uri_to_path(uri):
+    """file:// URI → 本机路径；其余 URI（sftp:// 等）原样透传给文件管理器。
+    只有 host 为空或 localhost 时才转本地路径，
+    避免 file://localhost/tmp 被错误解析成 "localhost/tmp"。"""
+    u = str(uri)
+    if not u.startswith("file:"):
+        return u
+    parsed = urlparse(u)
+    if parsed.netloc not in ("", "localhost"):
+        return u
+    return unquote(parsed.path)
+
+
+def reload_config():
+    """重新读取配置；失败或为空时保留当前生效的旧值。"""
+    parts = load_command()
+    if parts is None:
+        log("config reload: file missing or empty, keeping previous command")
+        return
+    if parts != CONFIG:
+        CONFIG[:] = parts
+        log("config reloaded: command = " + " ".join(CONFIG))
+
+
+def _do_reload():
+    """防抖定时器到点，真正执行一次重载。"""
+    global _reload_timer
+    _reload_timer = None
+    reload_config()
+    return False  # 一次性定时器
+
+
+def _on_config_changed(monitor, file, other_file, event):
+    """配置文件变化回调。编辑器常做“写临时文件+rename 替换”，
+    短时间触发多次事件，这里做 300ms 防抖后再读。"""
+    global _reload_timer
+    if _reload_timer is not None:
+        GLib.source_remove(_reload_timer)
+    _reload_timer = GLib.timeout_add(300, _do_reload)
 
 
 class FileManager1(dbus.service.Object):
-    def __init__(self, command, bus, path):
-        self.command = command
-        super().__init__(bus, path)
-
     def _open(self, uris):
         reap()                               # 先回收上一批已结束的子进程
-        args = list(self.command)
+        args = list(CONFIG)
         for uri in uris:
-            path = str(uri)
-            if path.startswith("file://"):   # 去前缀 + URL 解码，得到本机路径
-                path = unquote(path[len("file://"):])
-            args.append(path)
+            args.append(uri_to_path(uri))
         try:
             # 不等待、脱离会话启动，避免拖住 dbus 调用方
             _procs.append(Popen(args, stdin=DEVNULL, stdout=DEVNULL,
@@ -107,10 +151,21 @@ def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     session_bus = dbus.SessionBus()
 
-    command = load_command()
-    log("command = " + " ".join(command))
+    parts = load_command()
+    CONFIG[:] = parts if parts is not None else list(DEFAULT_COMMAND)
+    log("command = " + " ".join(CONFIG))
 
-    # 注意：这两个对象必须一直持有引用，否则被 GC 回收时名字/对象路径会失效
+    # 监听配置文件变化，实现热重载；文件尚不存在也能监听（创建时触发）
+    try:
+        monitor = Gio.File.new_for_path(CONFIG_FILE).monitor_file(
+            Gio.FileMonitorFlags.NONE, None)
+        monitor.connect("changed", _on_config_changed)
+        log("watching config for changes (hot reload enabled)")
+    except GLib.Error as e:
+        log(f"cannot watch config file, hot reload disabled: {e}")
+
+    # 注意：bus_name / fm_object / monitor 必须一直持有引用（main 的局部变量
+    # 在 mainloop 运行期间不会释放），否则被 GC 回收时名字/监听会失效
     try:
         bus_name = dbus.service.BusName(BUS_NAME, session_bus,
                                         allow_replacement=False,
@@ -120,7 +175,7 @@ def main():
         log(f"{BUS_NAME} is already owned by someone else; exiting")
         return 1
 
-    fm_object = FileManager1(command, session_bus, OBJ_PATH)
+    fm_object = FileManager1(session_bus, OBJ_PATH)
     GLib.timeout_add(500, reap)   # 每 0.5 秒回收一次，僵尸不会积压
     log("listening for method calls")
 

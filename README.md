@@ -82,7 +82,8 @@ systemctl --user enable --now fm1-daemon.service
 
 ## 配置
 
-编辑 `~/.config/fm1-daemon/command`，**一行一个参数**。默认内容：
+编辑 `~/.config/fm1-daemon/command`，**一行一个参数**（也可用环境变量
+`FM1_DAEMON_CONFIG` 指定其他路径）。默认内容：
 
 ```
 /usr/bin/thunar
@@ -105,11 +106,15 @@ systemctl --user enable --now fm1-daemon.service
 yazi
 ```
 
-改完重启生效：
+改完保存即生效（守护进程会监听配置文件变化自动热重载，
+日志里会记一行 `config reloaded: ...`）：
 
 ```bash
-systemctl --user restart fm1-daemon
+journalctl --user -u fm1-daemon -f
 ```
+
+> 注：若配置文件被临时清空或删除，热重载会保留当前生效的旧值，
+> 不会回退到默认 Thunar；下次写入有效内容后自动切换。
 
 ## 验证
 
